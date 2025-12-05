@@ -246,6 +246,23 @@ def extract_og_image(html: str) -> Optional[str]:
     return None
 
 
+def detect_private_in_html(platform: PlatformType, html: str) -> bool:
+    private_markers = [
+        r'"is_private"\s*:\s*true',
+        r'"isPrivate"\s*:\s*true',
+        r'"privateAccount"\s*:\s*true',
+        r"this account is private",
+        r"account is private",
+    ]
+    for pattern in private_markers:
+        if re.search(pattern, html, flags=re.IGNORECASE):
+            return True
+    # Instagram-specific text marker
+    if platform == PlatformType.INSTAGRAM and "This Account is Private" in html:
+        return True
+    return False
+
+
 def _parse_int(value: str) -> Optional[int]:
     try:
         cleaned = value.replace(",", "").replace(".", "")
@@ -259,6 +276,7 @@ def extract_counts(html: str) -> tuple[Optional[int], Optional[int]]:
     follower_patterns = [
         r'"followerCount"\s*:\s*(\d+)',
         r'"followers_count"\s*:\s*(\d+)',
+        r'"edge_followed_by"\s*:\s*\{"count"\s*:\s*(\d+)',
         r'"fans"\s*:\s*(\d+)',
         r'"fans"\s*:\s*"([\d,\.]+)"',
         r'"followers"\s*:\s*"([\d,\.]+)"',
@@ -267,6 +285,7 @@ def extract_counts(html: str) -> tuple[Optional[int], Optional[int]]:
         r'"followingCount"\s*:\s*(\d+)',
         r'"following"\s*:\s*(\d+)',
         r'"following"\s*:\s*"([\d,\.]+)"',
+        r'"edge_follow"\s*:\s*\{"count"\s*:\s*(\d+)',
     ]
     follower_count = None
     following_count = None
@@ -343,6 +362,8 @@ class SimpleHTMLProvider:
         if resp.status_code == 200 and resp.text:
             avatar_url = extract_og_image(resp.text)
             follower_count, following_count = extract_counts(resp.text)
+            if detect_private_in_html(self.platform, resp.text):
+                visibility = VisibilityState.PRIVATE
         return ProfileData(
             avatar_url=avatar_url,
             visibility_state=visibility,
