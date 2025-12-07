@@ -20,6 +20,11 @@ from typing import Optional, Protocol
 from urllib.parse import urlparse
 
 import httpx
+try:
+    from instagpy import InstaGPy  # type: ignore
+    INSTAGPY_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    INSTAGPY_AVAILABLE = False
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -281,12 +286,14 @@ def extract_counts(html: str) -> tuple[Optional[int], Optional[int]]:
         r'"fans"\s*:\s*(\d+)',
         r'"fans"\s*:\s*"([\d,\.]+)"',
         r'"followers"\s*:\s*"([\d,\.]+)"',
+        r'([\d,\.]+)\s+followers',  # og:description style
     ]
     following_patterns = [
         r'"followingCount"\s*:\s*(\d+)',
         r'"following"\s*:\s*(\d+)',
         r'"following"\s*:\s*"([\d,\.]+)"',
         r'"edge_follow"\s*:\s*\{"count"\s*:\s*(\d+)',
+        r'([\d,\.]+)\s+following',  # og:description style
     ]
     follower_count = None
     following_count = None
@@ -338,6 +345,35 @@ class ProfileProvider(Protocol):
         ...
 
 
+class InstagramAPIProvider:
+    """
+    Use instagpy (requires a valid Instagram session cookie) to fetch counts even for login-walled profiles.
+    """
+
+    def __init__(self, session_ids: list[str]):
+        self.session_ids = session_ids
+
+    async def fetch_profile(self, profile_url: str, client: httpx.AsyncClient) -> ProfileData:
+        username = short_profile_name(profile_url)
+        try:
+            insta = InstaGPy(session_ids=self.session_ids, use_mutiple_account=False)
+            data = await asyncio.to_thread(insta.get_user_basic_details, username, False)  # type: ignore[arg-type]
+            followers = data.get("follower_count") or data.get("followers")
+            following = data.get("following_count") or data.get("followings")
+            avatar_url = data.get("profile_pic_url_hd") or data.get("profile_pic_url")
+            is_private = data.get("is_private", False)
+            visibility = VisibilityState.PRIVATE if is_private else VisibilityState.PUBLIC
+            return ProfileData(
+                avatar_url=avatar_url,
+                visibility_state=visibility,
+                follower_count=_parse_int(str(followers)) if followers is not None else None,
+                following_count=_parse_int(str(following)) if following is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("instagpy failed for %s: %s", profile_url, exc)
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+
 class SimpleHTMLProvider:
     """Fetch avatar via public HTML; visibility inferred from HTTP status."""
 
@@ -382,8 +418,16 @@ class SimpleHTMLProvider:
         )
 
 
+INSTAGRAM_SESSION_IDS = [
+    sid.strip()
+    for sid in os.getenv("INSTAGRAM_SESSION_IDS", "").split(",")
+    if sid.strip()
+]
+
 PROVIDERS: dict[PlatformType, ProfileProvider] = {
-    PlatformType.INSTAGRAM: SimpleHTMLProvider(PlatformType.INSTAGRAM),
+    PlatformType.INSTAGRAM: InstagramAPIProvider(INSTAGRAM_SESSION_IDS)
+    if INSTAGPY_AVAILABLE and INSTAGRAM_SESSION_IDS
+    else SimpleHTMLProvider(PlatformType.INSTAGRAM),
     PlatformType.TWITTER: SimpleHTMLProvider(PlatformType.TWITTER),
     PlatformType.SOUNDCLOUD: SimpleHTMLProvider(PlatformType.SOUNDCLOUD),
     PlatformType.TUMBLR: SimpleHTMLProvider(PlatformType.TUMBLR),
