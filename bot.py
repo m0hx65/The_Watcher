@@ -351,11 +351,14 @@ class SimpleHTMLProvider:
             logger.warning("HTTP error for %s: %s", profile_url, exc)
             return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
 
-        visibility = VisibilityState.PUBLIC
+        # Start unknown until we confirm the page is reachable
+        visibility = VisibilityState.UNKNOWN
         if resp.status_code in (401, 403):
             visibility = VisibilityState.PRIVATE
         elif resp.status_code >= 400:
             visibility = VisibilityState.UNKNOWN
+        elif resp.status_code == 200:
+            visibility = VisibilityState.PUBLIC
 
         avatar_url: Optional[str] = None
         follower_count: Optional[int] = None
@@ -363,7 +366,13 @@ class SimpleHTMLProvider:
         if resp.status_code == 200 and resp.text:
             avatar_url = extract_og_image(resp.text)
             follower_count, following_count = extract_counts(resp.text)
-            if detect_private_in_html(self.platform, resp.text):
+
+            # Detect login/private pages even when the status code is 200 (e.g., Instagram login wall).
+            is_login_redirect = "login" in resp.url.path.lower() or "signin" in resp.url.path.lower()
+            login_markers = ["log in to see", "login", "sign in", "private account"]
+            if detect_private_in_html(self.platform, resp.text) or is_login_redirect or any(
+                marker in resp.text.lower() for marker in login_markers
+            ):
                 visibility = VisibilityState.PRIVATE
         return ProfileData(
             avatar_url=avatar_url,
@@ -786,7 +795,7 @@ async def account_detail(callback: CallbackQuery) -> None:
             .where(TrackedAccount.id == account_id)
         )
         account = result.scalar_one_or_none()
-        if not account or account.user_id != callback.from_user.id:
+        if not account or account.user.telegram_user_id != callback.from_user.id:
             await callback.answer("Not found.")
             return
         snapshot = await latest_snapshot(session, account.id)
@@ -847,7 +856,7 @@ async def remove_target(callback: CallbackQuery) -> None:
             select(TrackedAccount).where(TrackedAccount.id == account_id).options(selectinload(TrackedAccount.user))
         )
         account = result.scalar_one_or_none()
-        if not account or account.user_id != callback.from_user.id:
+        if not account or account.user.telegram_user_id != callback.from_user.id:
             await callback.answer("Not found.")
             return
         session.delete(account)
