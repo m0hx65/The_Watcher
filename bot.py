@@ -64,7 +64,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 
 DATABASE_URL = f"sqlite+aiosqlite:///{(DATA_DIR / 'bot.db').as_posix()}"
-CHECK_INTERVAL_MINUTES = 60
+CHECK_INTERVAL_MINUTES = 30
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -640,54 +640,60 @@ async def add_account_start(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AddAccountStates.waiting_for_url)
 async def handle_account_url(message: types.Message, state: FSMContext, bot: Bot) -> None:
-    url_raw = message.text or ""
-    normalized = normalize_url(url_raw)
-    if not normalized:
+    raw_text = message.text or ""
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
         await message.answer(
             "I can't understand this link. Please send a direct link to a profile on Instagram, X (Twitter), SoundCloud, Tumblr, or similar."
         )
         return
 
-    platform = detect_platform(normalized)
-    if platform == PlatformType.UNKNOWN:
-        await message.answer(
-            "I can't understand this link. Please send a direct link to a profile on Instagram, X (Twitter), SoundCloud, Tumblr, or similar."
-        )
-        return
-
+    results: list[str] = []
     async with AsyncSessionLocal() as session:
         user = await get_or_create_user(session, message.from_user.id)
-        existing = await session.execute(
-            select(TrackedAccount).where(
-                TrackedAccount.user_id == user.id, TrackedAccount.profile_url == normalized
-            )
-        )
-        if existing.scalar_one_or_none():
-            await message.answer("This account is already being watched.", reply_markup=main_menu_keyboard())
-            await state.clear()
-            return
-
-        account = TrackedAccount(
-            user_id=user.id,
-            platform=platform.value,
-            profile_url=normalized,
-            last_visibility_state=VisibilityState.UNKNOWN.value,
-        )
-        account.user = user
-        session.add(account)
-        await session.commit()
-        await session.refresh(account)
-
-        await message.answer("Account saved. Running the first check now...")
         client = await get_http_client()
-        try:
-            await check_account(session, bot, account, client, notify=False)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Initial check failed: %s", exc)
-            await message.answer("I couldn't check this profile right now, will retry later.")
-        await session.commit()
 
-    await message.answer("All set! I'll notify you if the avatar or visibility changes.", reply_markup=main_menu_keyboard())
+        for url_raw in lines:
+            normalized = normalize_url(url_raw)
+            if not normalized:
+                results.append(f"{url_raw} → skipped (invalid URL)")
+                continue
+
+            platform = detect_platform(normalized)
+            if platform == PlatformType.UNKNOWN:
+                results.append(f"{normalized} → skipped (unsupported platform)")
+                continue
+
+            existing = await session.execute(
+                select(TrackedAccount).where(
+                    TrackedAccount.user_id == user.id, TrackedAccount.profile_url == normalized
+                )
+            )
+            if existing.scalar_one_or_none():
+                results.append(f"{normalized} → already tracked")
+                continue
+
+            account = TrackedAccount(
+                user_id=user.id,
+                platform=platform.value,
+                profile_url=normalized,
+                last_visibility_state=VisibilityState.UNKNOWN.value,
+            )
+            account.user = user
+            session.add(account)
+            await session.commit()
+            await session.refresh(account)
+
+            try:
+                await check_account(session, bot, account, client, notify=False)
+                await session.commit()
+                results.append(f"{normalized} → added")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Initial check failed for %s: %s", normalized, exc)
+                results.append(f"{normalized} → added but initial check failed (will retry)")
+
+    summary = "Done:\n" + "\n".join(results)
+    await message.answer(summary, reply_markup=main_menu_keyboard())
     await state.clear()
 
 
@@ -789,13 +795,14 @@ async def account_detail(callback: CallbackQuery) -> None:
     page = int(page_str) if page_str.isdigit() else 1
 
     async with AsyncSessionLocal() as session:
+        current_user = await get_or_create_user(session, callback.from_user.id)
         result = await session.execute(
             select(TrackedAccount)
             .options(selectinload(TrackedAccount.snapshots))
             .where(TrackedAccount.id == account_id)
         )
         account = result.scalar_one_or_none()
-        if not account or account.user.telegram_user_id != callback.from_user.id:
+        if not account or account.user_id != current_user.id:
             await callback.answer("Not found.")
             return
         snapshot = await latest_snapshot(session, account.id)
@@ -852,11 +859,12 @@ async def remove_account(callback: CallbackQuery) -> None:
 async def remove_target(callback: CallbackQuery) -> None:
     account_id = int(callback.data.split(":", maxsplit=1)[1])
     async with AsyncSessionLocal() as session:
+        current_user = await get_or_create_user(session, callback.from_user.id)
         result = await session.execute(
             select(TrackedAccount).where(TrackedAccount.id == account_id).options(selectinload(TrackedAccount.user))
         )
         account = result.scalar_one_or_none()
-        if not account or account.user.telegram_user_id != callback.from_user.id:
+        if not account or account.user_id != current_user.id:
             await callback.answer("Not found.")
             return
         session.delete(account)
