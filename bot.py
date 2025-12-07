@@ -428,12 +428,17 @@ class InstagramGuestProvider:
     Use a guest (no sessionid) flow: first fetch homepage to obtain csrftoken, then call web_profile_info.
     """
 
+    def __init__(self) -> None:
+        # Reuse a per-process web session id to look closer to browser traffic.
+        self.web_session_id = os.getenv("IG_WEB_SESSION_ID") or f"{os.urandom(3).hex()}:{os.urandom(3).hex()}:{os.urandom(3).hex()}"
+
     async def fetch_profile(self, profile_url: str, client: httpx.AsyncClient) -> ProfileData:
         username = short_profile_name(profile_url)
         # Step 1: warm up to get csrftoken
         try:
             warmup = await client.get("https://www.instagram.com/", headers={"User-Agent": USER_AGENT})
             csrf = warmup.cookies.get("csrftoken")
+            mid = warmup.cookies.get("mid")
         except httpx.HTTPError as exc:
             logger.warning("Instagram guest warmup failed: %s", exc)
             return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
@@ -448,6 +453,7 @@ class InstagramGuestProvider:
                 api_url,
                 headers={
                     "User-Agent": USER_AGENT,
+                    "Accept": "*/*",
                     "Referer": f"https://www.instagram.com/{username}/",
                     "X-Requested-With": "XMLHttpRequest",
                     "X-IG-App-ID": "936619743392459",
@@ -455,7 +461,9 @@ class InstagramGuestProvider:
                     "Accept-Language": "en-US,en;q=0.9",
                     "X-IG-WWW-Claim": os.getenv("IG_WWW_CLAIM", "0"),
                     "X-CSRFToken": csrf,
+                    "X-Web-Session-Id": self.web_session_id,
                 },
+                cookies={k: v for k, v in {"csrftoken": csrf, "mid": mid}.items() if v},
             )
         except httpx.HTTPError as exc:
             logger.warning("Instagram guest request failed for %s: %s", profile_url, exc)
@@ -1019,17 +1027,21 @@ async def remove_target(callback: CallbackQuery) -> None:
     account_id = int(callback.data.split(":", maxsplit=1)[1])
     async with AsyncSessionLocal() as session:
         current_user = await get_or_create_user(session, callback.from_user.id)
-        result = await session.execute(
-            select(TrackedAccount).where(TrackedAccount.id == account_id).options(selectinload(TrackedAccount.user))
+        account = await session.scalar(
+            select(TrackedAccount)
+            .options(selectinload(TrackedAccount.user))
+            .where(TrackedAccount.id == account_id, TrackedAccount.user_id == current_user.id)
         )
-        account = result.scalar_one_or_none()
-        if not account or account.user_id != current_user.id:
+        if not account:
             await callback.answer("Not found.")
             return
         session.delete(account)
         await session.commit()
 
-    await safe_edit_text(callback.message, "Account removed.", reply_markup=main_menu_keyboard())
+    if callback.message:
+        await safe_edit_text(callback.message, "Account removed.", reply_markup=main_menu_keyboard())
+    else:
+        await callback.bot.send_message(callback.from_user.id, "Account removed.", reply_markup=main_menu_keyboard())
     await callback.answer("Removed")
 
 
