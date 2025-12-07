@@ -374,6 +374,116 @@ class InstagramAPIProvider:
             return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
 
 
+class InstagramSessionProvider:
+    """
+    Use raw Instagram sessionid to hit the web_profile_info endpoint directly.
+    """
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+
+    async def fetch_profile(self, profile_url: str, client: httpx.AsyncClient) -> ProfileData:
+        username = short_profile_name(profile_url)
+        api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+        try:
+            resp = await client.get(
+                api_url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Referer": f"https://www.instagram.com/{username}/",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "X-IG-App-ID": "936619743392459",
+                },
+                cookies={"sessionid": self.session_id},
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Instagram session request failed for %s: %s", profile_url, exc)
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+        if resp.status_code != 200:
+            logger.info("Instagram session request %s returned %s", api_url, resp.status_code)
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+        try:
+            data = resp.json()
+            user = data.get("data", {}).get("user", {})
+            followers = user.get("edge_followed_by", {}).get("count")
+            following = user.get("edge_follow", {}).get("count")
+            avatar_url = user.get("profile_pic_url_hd") or user.get("profile_pic_url")
+            is_private = user.get("is_private", False)
+            visibility = VisibilityState.PRIVATE if is_private else VisibilityState.PUBLIC
+            return ProfileData(
+                avatar_url=avatar_url,
+                visibility_state=visibility,
+                follower_count=followers,
+                following_count=following,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Instagram session JSON parse failed for %s: %s", profile_url, exc)
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+
+class InstagramGuestProvider:
+    """
+    Use a guest (no sessionid) flow: first fetch homepage to obtain csrftoken, then call web_profile_info.
+    """
+
+    async def fetch_profile(self, profile_url: str, client: httpx.AsyncClient) -> ProfileData:
+        username = short_profile_name(profile_url)
+        # Step 1: warm up to get csrftoken
+        try:
+            warmup = await client.get("https://www.instagram.com/", headers={"User-Agent": USER_AGENT})
+            csrf = warmup.cookies.get("csrftoken")
+        except httpx.HTTPError as exc:
+            logger.warning("Instagram guest warmup failed: %s", exc)
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+        if not csrf:
+            logger.info("Instagram guest flow missing csrftoken")
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+        api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+        try:
+            resp = await client.get(
+                api_url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Referer": f"https://www.instagram.com/{username}/",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "X-IG-App-ID": "936619743392459",
+                    "X-Asbd-Id": os.getenv("IG_ASBD_ID", "129477"),
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "X-IG-WWW-Claim": os.getenv("IG_WWW_CLAIM", "0"),
+                    "X-CSRFToken": csrf,
+                },
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Instagram guest request failed for %s: %s", profile_url, exc)
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+        if resp.status_code != 200:
+            logger.info("Instagram guest request %s returned %s", api_url, resp.status_code)
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+        try:
+            data = resp.json()
+            user = data.get("data", {}).get("user", {})
+            followers = user.get("edge_followed_by", {}).get("count")
+            following = user.get("edge_follow", {}).get("count")
+            avatar_url = user.get("profile_pic_url_hd") or user.get("profile_pic_url")
+            is_private = user.get("is_private", False)
+            visibility = VisibilityState.PRIVATE if is_private else VisibilityState.PUBLIC
+            return ProfileData(
+                avatar_url=avatar_url,
+                visibility_state=visibility,
+                follower_count=followers,
+                following_count=following,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Instagram guest JSON parse failed for %s: %s", profile_url, exc)
+            return ProfileData(avatar_url=None, visibility_state=VisibilityState.UNKNOWN)
+
+
 class SimpleHTMLProvider:
     """Fetch avatar via public HTML; visibility inferred from HTTP status."""
 
@@ -423,11 +533,16 @@ INSTAGRAM_SESSION_IDS = [
     for sid in os.getenv("INSTAGRAM_SESSION_IDS", "").split(",")
     if sid.strip()
 ]
+INSTAGRAM_SESSIONID_SINGLE = os.getenv("INSTAGRAM_SESSIONID", "").strip()
 
 PROVIDERS: dict[PlatformType, ProfileProvider] = {
-    PlatformType.INSTAGRAM: InstagramAPIProvider(INSTAGRAM_SESSION_IDS)
-    if INSTAGPY_AVAILABLE and INSTAGRAM_SESSION_IDS
-    else SimpleHTMLProvider(PlatformType.INSTAGRAM),
+    PlatformType.INSTAGRAM: (
+        InstagramSessionProvider(INSTAGRAM_SESSIONID_SINGLE)
+        if INSTAGRAM_SESSIONID_SINGLE
+        else InstagramAPIProvider(INSTAGRAM_SESSION_IDS)
+        if INSTAGPY_AVAILABLE and INSTAGRAM_SESSION_IDS
+        else InstagramGuestProvider()
+    ),
     PlatformType.TWITTER: SimpleHTMLProvider(PlatformType.TWITTER),
     PlatformType.SOUNDCLOUD: SimpleHTMLProvider(PlatformType.SOUNDCLOUD),
     PlatformType.TUMBLR: SimpleHTMLProvider(PlatformType.TUMBLR),
