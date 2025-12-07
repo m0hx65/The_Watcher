@@ -27,6 +27,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -529,7 +530,9 @@ async def notify_user_of_change(
 ) -> None:
     parts: list[str] = []
     if avatar_changed:
-        parts.append(f"Profile picture changed for {account.platform.title()} {short_profile_name(account.profile_url)}.")
+        parts.append(
+            f"Profile picture changed for {account.platform.title()} {short_profile_name(account.profile_url)}."
+        )
     if visibility_changed:
         parts.append(
             f"Visibility changed for {account.platform.title()} {short_profile_name(account.profile_url)}: "
@@ -605,6 +608,18 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
         "Use the buttons below to add or manage accounts."
     )
     await message.answer(welcome, reply_markup=main_menu_keyboard())
+
+
+async def safe_edit_text(message: types.Message, text: str, **kwargs) -> None:
+    """
+    Try editing the message; if it fails (e.g., message too old/not modified), send a new one.
+    This prevents callback buttons from silently failing when Telegram rejects an edit.
+    """
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as exc:
+        logger.info("Edit failed (%s), sending new message instead", exc)
+        await message.answer(text, **kwargs)
 
 
 @router.callback_query(F.data == "add_account")
@@ -696,7 +711,7 @@ async def render_accounts_list(
     if not accounts:
         text = "You have no tracked accounts yet."
         if message:
-            await message.edit_text(text, reply_markup=main_menu_keyboard())
+            await safe_edit_text(message, text, reply_markup=main_menu_keyboard())
         else:
             if bot is None:
                 return
@@ -725,9 +740,9 @@ async def render_accounts_list(
     if total_pages > 1:
         nav_buttons = []
         if page > 1:
-            nav_buttons.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"list_accounts:{page-1}"))
+            nav_buttons.append(InlineKeyboardButton(text="< Prev", callback_data=f"list_accounts:{page-1}"))
         if page < total_pages:
-            nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"list_accounts:{page+1}"))
+            nav_buttons.append(InlineKeyboardButton(text="Next >", callback_data=f"list_accounts:{page+1}"))
         if nav_buttons:
             builder.row(*nav_buttons)
     builder.button(text="Back", callback_data="back_to_menu")
@@ -735,7 +750,7 @@ async def render_accounts_list(
 
     text = "Your tracked accounts:\n" + "\n".join(lines)
     if message:
-        await message.edit_text(text, reply_markup=builder.as_markup())
+        await safe_edit_text(message, text, reply_markup=builder.as_markup())
     else:
         await bot.send_message(chat_id, text, reply_markup=builder.as_markup())
 
@@ -750,7 +765,7 @@ async def handle_list_accounts(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery) -> None:
-    await callback.message.edit_text("Choose an action:", reply_markup=main_menu_keyboard())
+    await safe_edit_text(callback.message, "Choose an action:", reply_markup=main_menu_keyboard())
     await callback.answer()
 
 
@@ -791,10 +806,10 @@ async def account_detail(callback: CallbackQuery) -> None:
         f"Last avatar change: {last_avatar}"
     )
     builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Back to list", callback_data=f"list_accounts:{page}")
+    builder.button(text="Back to list", callback_data=f"list_accounts:{page}")
     builder.button(text="Remove this account", callback_data=f"remove_target:{account.id}")
     builder.adjust(1)
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await safe_edit_text(callback.message, text, reply_markup=builder.as_markup())
     await callback.answer()
 
 
@@ -808,7 +823,7 @@ async def remove_account(callback: CallbackQuery) -> None:
         accounts = result.scalars().all()
 
     if not accounts:
-        await callback.message.edit_text("You have no tracked accounts.", reply_markup=main_menu_keyboard())
+        await safe_edit_text(callback.message, "You have no tracked accounts.", reply_markup=main_menu_keyboard())
         await callback.answer()
         return
 
@@ -820,7 +835,7 @@ async def remove_account(callback: CallbackQuery) -> None:
         )
     builder.button(text="Cancel", callback_data="back_to_menu")
     builder.adjust(1)
-    await callback.message.edit_text("Choose an account to remove:", reply_markup=builder.as_markup())
+    await safe_edit_text(callback.message, "Choose an account to remove:", reply_markup=builder.as_markup())
     await callback.answer()
 
 
@@ -838,7 +853,7 @@ async def remove_target(callback: CallbackQuery) -> None:
         session.delete(account)
         await session.commit()
 
-    await callback.message.edit_text("Account removed.", reply_markup=main_menu_keyboard())
+    await safe_edit_text(callback.message, "Account removed.", reply_markup=main_menu_keyboard())
     await callback.answer("Removed")
 
 
@@ -887,3 +902,4 @@ if __name__ == "__main__":
 # aiosqlite>=0.19.0
 # Pillow>=10.0.0
 # apscheduler>=3.10.0
+
